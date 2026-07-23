@@ -333,11 +333,23 @@ class Read_era5:
         self.theta_soil[:, 2, :, :] = self.theta_soil3[:, :, :]
         self.theta_soil[:, 3, :, :] = self.theta_soil4[:, :, :]
 
-    def calculate_forcings(self, n_av=0, method='4th'):
+    def calculate_forcings(self, n_av=0, method='4th', n_av_lat=None, n_av_lon=None):
         """
         Calculate the advective tendencies, geostrophic wind, et cetera.
+
+        `n_av` gives a square averaging box of (2*n_av+1)^2 grid points.
+        For a rectangular box, set `n_av_lat` and/or `n_av_lon` (grid points
+        each side of the centre, per axis); either one falls back to `n_av`.
         """
         header('Calculating large-scale forcings')
+
+        # Per-axis averaging half-widths (in grid points). NOTE: n_av_lon
+        # pairs with self.i/lons (array axis 3), n_av_lat with self.j/lats
+        # (array axis 2) — keep this pairing when editing the slices below.
+        if n_av_lat is None:
+            n_av_lat = n_av
+        if n_av_lon is None:
+            n_av_lon = n_av
 
         # Find nearest location on (regular lat/lon) grid
         self.i = np.abs(self.lons - self.settings['central_lon']).argmin()
@@ -362,16 +374,27 @@ class Read_era5:
         )
 
         # Print averaging area.
-        dlon = (1 + 2 * n_av) * float(self.lons[1] - self.lons[0])
-        dlat = (1 + 2 * n_av) * float(self.lats[1] - self.lats[0])
+        dlon = (1 + 2 * n_av_lon) * float(self.lons[1] - self.lons[0])
+        dlat = (1 + 2 * n_av_lat) * float(self.lats[1] - self.lats[0])
         self.area = f'{dlon:.2f}°×{dlat:.2f}°'
         message(f'Averaging ERA5 over a {self.area} spatial area.')
 
         # Start and end indices of averaging domain:
-        istart = self.i - n_av
-        iend = self.i + n_av + 1
-        jstart = self.j - n_av
-        jend = self.j + n_av + 1
+        istart = self.i - n_av_lon
+        iend = self.i + n_av_lon + 1
+        jstart = self.j - n_av_lat
+        jend = self.j + n_av_lat + 1
+
+        # A box exceeding the downloaded grid would silently wrap through
+        # numpy's negative indexing and average the wrong columns — refuse it.
+        # The 4th-order gradients additionally reach 2 points outside the box.
+        margin = 2 if method == '4th' else 0
+        if (istart - margin < 0 or iend + margin > self.nlon or
+                jstart - margin < 0 or jend + margin > self.nlat):
+            error(f'Averaging box (n_av_lat={n_av_lat}, n_av_lon={n_av_lon}, '
+                  f'method={method}, margin={margin}) exceeds the downloaded '
+                  f'ERA5 grid ({self.nlat}x{self.nlon} points, centre index '
+                  f'j={self.j}, i={self.i}).')
 
         # Numpy slicing tuples for averaging domain
         center4d = np.s_[:, :, jstart:jend, istart:iend]
