@@ -57,11 +57,41 @@ class Slice:
         return np.s_[:, :, self.jstart + dj : self.jend + dj, self.istart + di : self.iend + di]
 
 
+def _coord(a):
+    """
+    MJC fix: coordinate as a plain float64 array; masked entries become NaN, so that they
+    never compare equal (np.allclose on a masked array would skip them).
+    """
+    return np.ma.filled(np.ma.asarray(a, dtype=np.float64), np.nan)
+
+
+def same_latitudes(lat_a, lat_b):
+    """
+    MJC fix: True if two latitude arrays are equal (to 1e-4 deg).
+    """
+    a, b = _coord(lat_a), _coord(lat_b)
+    return a.shape == b.shape and bool(np.all(np.abs(a - b) <= 1e-4))
+
+
+def same_longitudes(lon_a, lon_b):
+    """
+    MJC fix: True if two longitude arrays are equal modulo 360 deg, to 1e-4 deg
+    (files can use 0..360 or -180..180).
+    """
+    a, b = _coord(lon_a), _coord(lon_b)
+    return a.shape == b.shape and bool(np.all(np.abs((a - b + 180.0) % 360.0 - 180.0) <= 1e-4))
+
+
 class Read_era5:
     """
     Read the ERA5 model/pressure/surface level data,
     and optionally calculate the LES/SCM forcings
     """
+
+    # MJC fix: read_data flips the latitude per file, so that all fields share one order (see there). Scripts that used to
+    # correct LS2D's pairing themselves (CM1 tools/lsforce_tv/run_ls2d_highz.py) test this
+    # flag so that they do not flip the fields a second time.
+    LAT_ORDER_PER_FILE = True
 
     def __init__(self, settings):
 
@@ -131,6 +161,20 @@ class Read_era5:
                 ds.close()
                 patch_netcdf(f)
 
+        # MJC fix: MFDataset takes the latitude/longitude of the first file of each list,
+        # so every file of a list must have the same horizontal coordinates (a file
+        # downloaded from another CDS/MARS version may run the other way).
+        for files in (an_sfc_files, an_model_files, an_pres_files):
+            with nc4.Dataset(files[0]) as nc:
+                lat0 = nc.variables['latitude'][:]
+                lon0 = nc.variables['longitude'][:]
+            for f in files[1:]:
+                with nc4.Dataset(f) as nc:
+                    lat = nc.variables['latitude'][:]
+                    lon = nc.variables['longitude'][:]
+                if not same_latitudes(lat, lat0) or not same_longitudes(lon, lon0):
+                    error('Latitude/longitude of "{}" differ from those of "{}"'.format(f, files[0]))
+
         # Open NetCDF files: MFDataset automatically merges the files / time dimensions
         self.fsa = nc4.MFDataset(an_sfc_files, aggdim='time')
         self.fma = nc4.MFDataset(an_model_files, aggdim='time')
@@ -141,29 +185,48 @@ class Read_era5:
         Read all the required variables from the NetCDF files
         """
 
-        def flip(array):
+        # MJC fix: LS2D flips the latitude of every file, which is right only when all
+        # files run the same way (MARS and the old CDS: all north to south). Since the
+        # March 2026 CDS change, regrid_netcdf writes the surface and pressure-level files
+        # south to north while the model-level files can stay north to south, and then each
+        # model-level column was paired with the surface column (surface pressure, hence
+        # p, z, Exner, theta) mirrored about the box centre. Now the model-level fields are
+        # flipped as before, and a surface or pressure-level file is flipped only if it runs
+        # the same way as the model-level file, so all fields end up in one order. Files
+        # that all run the same way give exactly the results of the old code.
+        def runs_north_to_south(nc):
+            lat = _coord(nc.variables['latitude'][:])
+            return bool(lat[0] > lat[-1])
+
+        lat_flip = {nc: runs_north_to_south(nc) == runs_north_to_south(self.fma)
+                    for nc in (self.fsa, self.fma, self.fpa)}
+
+        def flip(array, flip_lat):
             """
-            Flip the height and/or latitude dimensions
+            Flip the height dimension, and the latitude dimension if `flip_lat`
             """
             if len(array.shape) == 4:
                 # Reverse order of 4-dimensional field (time, height, lat, lon)
                 # in height (axis=1) and lat (axis=2) direction
-                return np.flip(np.flip(array, axis=1), axis=2)
+                array = np.flip(array, axis=1)
+                return np.flip(array, axis=2) if flip_lat else array
             elif len(array.shape) == 3:
                 # Reverse order of 3-dimensional field (time, lat, lon)
                 # in lat (axis=1) direction
-                return np.flip(array, axis=1)
+                return np.flip(array, axis=1) if flip_lat else array
             elif len(array.shape) == 1:
                 # Reverse order of 1-dimensional field (height)
                 return np.flip(array, axis=0)
+            else:
+                error('flip: unexpected number of dimensions ({})'.format(len(array.shape)))
 
         def get_variable(nc, var, dslice, wrap_func=None, dtype=None):
             """
-            Read NetCDF variable, and flip height and latitude dimensions.
+            Read NetCDF variable, and flip height and (if needed) latitude dimensions.
             Optionally, apply the `wrap_func` function on the data,
             and/or cast data to requested `dtype`.
             """
-            data = flip(nc.variables[var][dslice])
+            data = flip(nc.variables[var][dslice], lat_flip[nc])
             # Apply wrapper function (if provided):
             data = wrap_func(data) if wrap_func is not None else data
             # Cast to requested data type (if provided):
@@ -187,11 +250,24 @@ class Read_era5:
         t_an = np.s_[t0_an : t1_an + 1]
 
         # Read spatial and time variables
-        self.lats = self.fma.variables['latitude'][::-1]
+        def lats_as_read(nc):
+            lat = nc.variables['latitude'][:]
+            return lat[::-1] if lat_flip[nc] else lat
+
+        self.lats = lats_as_read(self.fma)
         self.lons = self.fma.variables['longitude'][:]
 
-        self.lats_p = self.fpa.variables['latitude'][::-1]
+        self.lats_p = lats_as_read(self.fpa)
         self.lons_p = self.fpa.variables['longitude'][:]
+
+        # MJC fix: the fields are combined point by point, so the three file types must
+        # share one horizontal grid (in the same order, after the latitude flips above).
+        for name, nc in (('surface', self.fsa), ('pressure level', self.fpa)):
+            lat = lats_as_read(nc)
+            lon = nc.variables['longitude'][:]
+            if not same_latitudes(lat, self.lats) or not same_longitudes(lon, self.lons):
+                error('The {} grid differs from the model-level grid (lat {} vs {}, lon {} vs {})'.format(
+                      name, lat[[0, -1]], self.lats[[0, -1]], lon[[0, -1]], self.lons[[0, -1]]))
 
         # Read time, and check if all files are synced.
         self.time = self.fma.variables['time'][t_an]
@@ -503,6 +579,9 @@ class Read_era5:
 
             # Re-calculate dxdi and dydj with pressure level grid.
             # In newer CDS ERA5 files, latitude dimension is flipped.
+            # (MJC fix: read_data now puts the pressure-level fields in the order of the
+            # model-level fields and checks that lats_p equals lats, so this repeats the
+            # model-level dxdi/dydj; kept as it was.)
             lat_rad = np.deg2rad(self.lats_p)
             lon_rad = np.deg2rad(self.lons_p)
             cos_lat = np.cos(lat_rad)

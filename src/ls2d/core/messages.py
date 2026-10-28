@@ -73,4 +73,5 @@ def error(message, exit=True):
     """
     print('{}{}ERROR:{} {}'.format(_opts['red'], _opts['bf'], _opts['end'], message))
     if exit:
-        sys.exit()
+        # MJC fix: a non-zero exit status, so that scripts and job chains see the failure
+        sys.exit(1)
