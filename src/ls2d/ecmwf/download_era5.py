@@ -179,8 +179,16 @@ def _download_era5_file(settings):
 
                 else:
                     error('Request failed, status = "{}"'.format(state), exit=False)
-                    message('Error message = {}'.format(cds_request.reply['error'].get('message')))
-                    message('Error reason = {}'.format(cds_request.reply['error'].get('reason')))
+                    err = cds_request.reply.get('error') or {}
+                    message('Error message = {}'.format(err.get('message', '(none)')))
+                    message('Error reason = {}'.format(err.get('reason', '(none)')))
+                    # MJC patch: auto-delete pickle for rejected/failed requests
+                    # so subsequent runs resubmit instead of looping on the same
+                    # failure. The new CDS API often returns 'rejected' due to
+                    # per-dataset queue limits; the right response is to retry.
+                    f.close()
+                    os.remove(pickle_file)
+                    message('Removed stale pickle, will resubmit on next run.')
 
         else:
             message('No previous CDS request, submitting new one')
@@ -288,6 +296,13 @@ def _download_era5_file(settings):
                 model_levels = '/'.join(list(np.arange(1, 138).astype(str)))
                 analysis_times = '/'.join(['{0:02d}:00:00'.format(i) for i in range(24)])
 
+                # MJC patch: add the same +/- 0.25 deg pad as pressure/surface_an,
+                # so the model-level grid matches pressure/surface after regrid_netcdf.
+                # Without this, model_an comes back on a smaller 5x5 box (21x21 pts)
+                # while pressure/surface are on a 5.5x5.5 box (23x23 pts), and the
+                # mismatch crashes Read_era5.calc_derived_data with a broadcast error.
+                pad = 0.25
+
                 request = {
                     'class': 'ea',
                     'date': '{0:04d}-{1:02d}-{2:02d}'.format(
@@ -302,7 +317,7 @@ def _download_era5_file(settings):
                     'stream': 'oper',
                     'time': analysis_times,
                     'type': 'an',
-                    'area': '{}/{}/{}/{}'.format(lat_n, lon_w, lat_s, lon_e),
+                    'area': '{}/{}/{}/{}'.format(lat_n + pad, lon_w - pad, lat_s - pad, lon_e + pad),
                     'grid': '0.25/0.25',
                     'format': 'netcdf',
                 }
